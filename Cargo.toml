@@ -2,8 +2,13 @@
 name = "guest"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "By-value memory storage without by-value memory access."
+repository = "https://github.com/Vi-Kitten/Guest"
+readme = "README.md"
+keywords = ["drop"]
+rust-version = "1.77.1"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-futures = "0.3.30"
