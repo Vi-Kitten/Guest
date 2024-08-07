@@ -1,6 +1,6 @@
 [package]
 name = "guest"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "By-value memory storage without by-value memory access."
@@ -12,3 +12,6 @@ rust-version = "1.77.1"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+
+[dev-dependencies]
+futures = "0.3.30"
