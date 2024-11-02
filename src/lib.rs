@@ -21,6 +21,7 @@ use futures::FutureExt;
 /// counter contains the number of current borrows + 1
 ///
 /// when the counter is 1 the contract is being terminated by a lessee
+#[derive(Debug)]
 struct Contract {
     counter: AtomicUsize,
     waker: UnsafeCell<MaybeUninit<Waker>>,
@@ -73,6 +74,9 @@ impl Contract {
             }
             return Some(());
         };
+        if previous == 0 {
+            return None;
+        }
         // wait for termination to finish
         while self.count() != 0 {}
         None
@@ -204,6 +208,16 @@ fn create_contract<T: ?Sized>(ptr: NonNull<T>) -> (Lessor, Lessee<T>) {
     let contract = Box::new(Contract::new());
     unsafe { contract.increment_unchecked() };
     let contract = Box::into_raw(contract);
+    // // occursed testing things
+    // unsafe {
+    //     let bingle: usize = contract as usize;
+    //     std::thread::spawn(move || {
+    //         for _ in 0..100 {
+    //             let contract: *const Contract = bingle as *const Contract;
+    //             println!("{:?}", contract.as_ref().unwrap());
+    //         }
+    //     });
+    // };
     (
         Lessor { contract },
         Lessee {
@@ -302,16 +316,16 @@ impl<T: ?Sized> From<UpgradableBorrow<T>> for Borrow<T> {
     }
 }
 
-pub struct BorrowGaurd<'scope, 'a: 'scope, T: ?Sized> {
+pub struct BorrowGaurd<'scope, 'a, T: ?Sized> {
     original: NonNull<T>,
     signal: futures::channel::oneshot::Receiver<()>,
     _borrow: PhantomData<&'a T>,
     _scope: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-unsafe impl<'scope, 'a: 'scope, T: ?Sized + Sync> Sync for BorrowGaurd<'scope, 'a, T> {}
+unsafe impl<'scope, 'a, T: ?Sized + Sync> Sync for BorrowGaurd<'scope, 'a, T> {}
 
-unsafe impl<'scope, 'a: 'scope, T: ?Sized + Sync> Send for BorrowGaurd<'scope, 'a, T> {}
+unsafe impl<'scope, 'a, T: ?Sized + Sync> Send for BorrowGaurd<'scope, 'a, T> {}
 
 impl<'scope, 'a: 'scope, T: ?Sized> Future for BorrowGaurd<'scope, 'a, T> {
     type Output = &'a T;
@@ -326,16 +340,16 @@ impl<'scope, 'a: 'scope, T: ?Sized> Future for BorrowGaurd<'scope, 'a, T> {
     }
 }
 
-pub struct BorrowMutGaurd<'scope, 'a: 'scope, T: ?Sized> {
+pub struct BorrowMutGaurd<'scope, 'a, T: ?Sized> {
     original: NonNull<T>,
     signal: futures::channel::oneshot::Receiver<()>,
     _borrow: PhantomData<&'a mut T>,
     _scope: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-unsafe impl<'scope, 'a: 'scope, T: ?Sized + Sync> Sync for BorrowMutGaurd<'scope, 'a, T> {}
+unsafe impl<'scope, 'a, T: ?Sized + Sync> Sync for BorrowMutGaurd<'scope, 'a, T> {}
 
-unsafe impl<'scope, 'a: 'scope, T: ?Sized + Send> Send for BorrowMutGaurd<'scope, 'a, T> {}
+unsafe impl<'scope, 'a, T: ?Sized + Send> Send for BorrowMutGaurd<'scope, 'a, T> {}
 
 impl<'scope, 'a: 'scope, T: ?Sized> Future for BorrowMutGaurd<'scope, 'a, T> {
     type Output = &'a mut T;
@@ -350,16 +364,16 @@ impl<'scope, 'a: 'scope, T: ?Sized> Future for BorrowMutGaurd<'scope, 'a, T> {
     }
 }
 
-pub struct PinningBorrowGaurd<'scope, 'a: 'scope, T: ?Sized> {
+pub struct PinningBorrowGaurd<'scope, 'a, T: ?Sized> {
     original: NonNull<T>,
     signal: futures::channel::oneshot::Receiver<()>,
     _borrow: PhantomData<Pin<&'a T>>,
     _scope: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-unsafe impl<'scope, 'a: 'scope, T: ?Sized + Sync> Sync for PinningBorrowGaurd<'scope, 'a, T> {}
+unsafe impl<'scope, 'a, T: ?Sized + Sync> Sync for PinningBorrowGaurd<'scope, 'a, T> {}
 
-unsafe impl<'scope, 'a: 'scope, T: ?Sized + Sync> Send for PinningBorrowGaurd<'scope, 'a, T> {}
+unsafe impl<'scope, 'a, T: ?Sized + Sync> Send for PinningBorrowGaurd<'scope, 'a, T> {}
 
 impl<'scope, 'a: 'scope, T: ?Sized> Future for PinningBorrowGaurd<'scope, 'a, T> {
     type Output = Pin<&'a T>;
@@ -374,16 +388,16 @@ impl<'scope, 'a: 'scope, T: ?Sized> Future for PinningBorrowGaurd<'scope, 'a, T>
     }
 }
 
-pub struct PinningBorrowMutGaurd<'scope, 'a: 'scope, T: ?Sized> {
+pub struct PinningBorrowMutGaurd<'scope, 'a, T: ?Sized> {
     original: NonNull<T>,
     signal: futures::channel::oneshot::Receiver<()>,
     _borrow: PhantomData<Pin<&'a mut T>>,
     _scope: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-unsafe impl<'scope, 'a: 'scope, T: ?Sized + Sync> Sync for PinningBorrowMutGaurd<'scope, 'a, T> {}
+unsafe impl<'scope, 'a, T: ?Sized + Sync> Sync for PinningBorrowMutGaurd<'scope, 'a, T> {}
 
-unsafe impl<'scope, 'a: 'scope, T: ?Sized + Send> Send for PinningBorrowMutGaurd<'scope, 'a, T> {}
+unsafe impl<'scope, 'a, T: ?Sized + Send> Send for PinningBorrowMutGaurd<'scope, 'a, T> {}
 
 impl<'scope, 'a: 'scope, T: ?Sized> Future for PinningBorrowMutGaurd<'scope, 'a, T> {
     type Output = Pin<&'a mut T>;
@@ -420,7 +434,9 @@ pub trait ScopeExt<'scope> {
     ) -> (PinningBorrowMutGaurd<'scope, 'a, T>, Pin<BorrowMut<T>>);
 }
 
-impl<'scope, Sp: Spawner<()> + Blocker> ScopeExt<'scope> for Scope<'scope, (), Sp> {
+impl<'scope, R: Default + Send + 'static, Sp: Spawner<R> + Blocker> ScopeExt<'scope>
+    for Scope<'scope, R, Sp>
+{
     fn lease<'a: 'scope, T: ?Sized>(
         &mut self,
         ptr: &'a T,
@@ -438,6 +454,7 @@ impl<'scope, Sp: Spawner<()> + Blocker> ScopeExt<'scope> for Scope<'scope, (), S
         self.spawn(async {
             lessor.await;
             sender.send(()).unwrap_or(());
+            R::default()
         });
         (gaurd, borrow)
     }
@@ -459,6 +476,7 @@ impl<'scope, Sp: Spawner<()> + Blocker> ScopeExt<'scope> for Scope<'scope, (), S
         self.spawn(async {
             lessor.await;
             sender.send(()).unwrap_or(());
+            R::default()
         });
         (gaurd, borrow)
     }
@@ -480,6 +498,7 @@ impl<'scope, Sp: Spawner<()> + Blocker> ScopeExt<'scope> for Scope<'scope, (), S
         self.spawn(async {
             lessor.await;
             sender.send(()).unwrap_or(());
+            R::default()
         });
         (gaurd, borrow)
     }
@@ -501,6 +520,7 @@ impl<'scope, Sp: Spawner<()> + Blocker> ScopeExt<'scope> for Scope<'scope, (), S
         self.spawn(async {
             lessor.await;
             sender.send(()).unwrap_or(());
+            R::default()
         });
         (gaurd, borrow)
     }
@@ -525,6 +545,7 @@ mod tests {
                     async move {
                         // await guard
                         let rx = gaurd.await;
+                        *rx += 2;
                     },
                     Default::default,
                 );
