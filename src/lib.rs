@@ -10,11 +10,9 @@ use std::{
     task::Waker,
 };
 
-use async_scoped::{
-    spawner::{Blocker, Spawner},
-    Scope,
-};
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
+
+use pin_project::{pin_project, pinned_drop};
 
 /// An async borrowing contract
 ///
@@ -114,9 +112,9 @@ impl Contract {
 ///
 /// Awaiting will wait until borrows end.
 ///
-/// **Dropping will break aliasing rules.**
-#[must_use = "dropping will break aliasing rules"]
-pub struct Lessor {
+/// **Pre-mature dropping will break aliasing rules.**
+#[must_use = "pre-mature dropping will break aliasing rules"]
+struct Lessor {
     contract: *mut Contract,
 }
 
@@ -169,8 +167,10 @@ impl Future for Lessor {
 /// A wrapper over the `Contract` type representing the lessee.
 ///
 /// Uses a reference count to borrow.
+#[pin_project(PinnedDrop)]
 struct Lessee<T: ?Sized> {
     contract: NonNull<Contract>,
+    #[pin]
     ptr: NonNull<T>,
 }
 
@@ -198,9 +198,10 @@ impl<T: ?Sized> Clone for Lessee<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Lessee<T> {
-    fn drop(&mut self) {
-        unsafe { self.contract.as_ref().decrement() };
+#[pinned_drop]
+impl<T: ?Sized> PinnedDrop for Lessee<T> {
+    fn drop(self: Pin<&mut Self>) {
+        unsafe { self.project().contract.as_ref().decrement() };
     }
 }
 
@@ -316,18 +317,17 @@ impl<T: ?Sized> From<UpgradableBorrow<T>> for Borrow<T> {
     }
 }
 
-pub struct BorrowGaurd<'scope, 'a, T: ?Sized> {
+pub struct BorrowHandle<'a, T: ?Sized> {
     original: NonNull<T>,
     signal: futures::channel::oneshot::Receiver<()>,
     _borrow: PhantomData<&'a T>,
-    _scope: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-unsafe impl<'scope, 'a, T: ?Sized + Sync> Sync for BorrowGaurd<'scope, 'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync> Sync for BorrowHandle<'a, T> {}
 
-unsafe impl<'scope, 'a, T: ?Sized + Sync> Send for BorrowGaurd<'scope, 'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync> Send for BorrowHandle<'a, T> {}
 
-impl<'scope, 'a: 'scope, T: ?Sized> Future for BorrowGaurd<'scope, 'a, T> {
+impl<'a, T: ?Sized> Future for BorrowHandle<'a, T> {
     type Output = &'a T;
 
     fn poll(
@@ -340,18 +340,17 @@ impl<'scope, 'a: 'scope, T: ?Sized> Future for BorrowGaurd<'scope, 'a, T> {
     }
 }
 
-pub struct BorrowMutGaurd<'scope, 'a, T: ?Sized> {
+pub struct BorrowMutHandle<'a, T: ?Sized> {
     original: NonNull<T>,
     signal: futures::channel::oneshot::Receiver<()>,
     _borrow: PhantomData<&'a mut T>,
-    _scope: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-unsafe impl<'scope, 'a, T: ?Sized + Sync> Sync for BorrowMutGaurd<'scope, 'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync> Sync for BorrowMutHandle<'a, T> {}
 
-unsafe impl<'scope, 'a, T: ?Sized + Send> Send for BorrowMutGaurd<'scope, 'a, T> {}
+unsafe impl<'a, T: ?Sized + Send> Send for BorrowMutHandle<'a, T> {}
 
-impl<'scope, 'a: 'scope, T: ?Sized> Future for BorrowMutGaurd<'scope, 'a, T> {
+impl<'a, T: ?Sized> Future for BorrowMutHandle<'a, T> {
     type Output = &'a mut T;
 
     fn poll(
@@ -364,18 +363,17 @@ impl<'scope, 'a: 'scope, T: ?Sized> Future for BorrowMutGaurd<'scope, 'a, T> {
     }
 }
 
-pub struct PinningBorrowGaurd<'scope, 'a, T: ?Sized> {
+pub struct PinningBorrowHandle<'a, T: ?Sized> {
     original: NonNull<T>,
     signal: futures::channel::oneshot::Receiver<()>,
     _borrow: PhantomData<Pin<&'a T>>,
-    _scope: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-unsafe impl<'scope, 'a, T: ?Sized + Sync> Sync for PinningBorrowGaurd<'scope, 'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync> Sync for PinningBorrowHandle<'a, T> {}
 
-unsafe impl<'scope, 'a, T: ?Sized + Sync> Send for PinningBorrowGaurd<'scope, 'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync> Send for PinningBorrowHandle<'a, T> {}
 
-impl<'scope, 'a: 'scope, T: ?Sized> Future for PinningBorrowGaurd<'scope, 'a, T> {
+impl<'a, T: ?Sized> Future for PinningBorrowHandle<'a, T> {
     type Output = Pin<&'a T>;
 
     fn poll(
@@ -388,18 +386,17 @@ impl<'scope, 'a: 'scope, T: ?Sized> Future for PinningBorrowGaurd<'scope, 'a, T>
     }
 }
 
-pub struct PinningBorrowMutGaurd<'scope, 'a, T: ?Sized> {
+pub struct PinningBorrowMutHandle<'a, T: ?Sized> {
     original: NonNull<T>,
     signal: futures::channel::oneshot::Receiver<()>,
     _borrow: PhantomData<Pin<&'a mut T>>,
-    _scope: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-unsafe impl<'scope, 'a, T: ?Sized + Sync> Sync for PinningBorrowMutGaurd<'scope, 'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync> Sync for PinningBorrowMutHandle<'a, T> {}
 
-unsafe impl<'scope, 'a, T: ?Sized + Send> Send for PinningBorrowMutGaurd<'scope, 'a, T> {}
+unsafe impl<'a, T: ?Sized + Send> Send for PinningBorrowMutHandle<'a, T> {}
 
-impl<'scope, 'a: 'scope, T: ?Sized> Future for PinningBorrowMutGaurd<'scope, 'a, T> {
+impl<'a, T: ?Sized> Future for PinningBorrowMutHandle<'a, T> {
     type Output = Pin<&'a mut T>;
 
     fn poll(
@@ -412,147 +409,255 @@ impl<'scope, 'a: 'scope, T: ?Sized> Future for PinningBorrowMutGaurd<'scope, 'a,
     }
 }
 
-pub trait ScopeExt<'scope> {
-    fn lease<'a: 'scope, T: ?Sized>(
-        &mut self,
-        ptr: &'a T,
-    ) -> (BorrowGaurd<'scope, 'a, T>, Borrow<T>);
+/// *trait is unsafe as the expectation that awaiting the returned future will await provided future
+/// cannot be expressed within the type system.*
+pub unsafe trait Spawner {
+    type JoinHandle<T: Send + 'static>: Future<Output = T> + Send + 'static;
 
-    fn lease_mut<'a: 'scope, T: ?Sized>(
-        &mut self,
-        ptr: &'a mut T,
-    ) -> (BorrowMutGaurd<'scope, 'a, T>, BorrowMut<T>);
+    type LocalJoinHandle<T: 'static>: Future<Output = T> + 'static;
 
-    fn pinning_lease<'a: 'scope, T: ?Sized>(
-        &mut self,
-        ptr: Pin<&'a T>,
-    ) -> (PinningBorrowGaurd<'scope, 'a, T>, Pin<Borrow<T>>);
+    /// Monomorphise handle types.
+    fn localise_handle<T: Send + 'static>(handle: Self::JoinHandle<T>) -> Self::LocalJoinHandle<T>;
 
-    fn pinning_lease_mut<'a: 'scope, T: ?Sized>(
-        &mut self,
-        ptr: Pin<&'a mut T>,
-    ) -> (PinningBorrowMutGaurd<'scope, 'a, T>, Pin<BorrowMut<T>>);
+    /// Spawn a new task with 'static lifetime.
+    ///
+    /// *unsafe trait impl: must return a join handle that when awaited awaits for the spawned future to finish.*
+    fn spawn_unscoped<T: Send + 'static>(
+        self: Pin<&mut Self>,
+        f: impl Future<Output = T> + Send + 'static,
+    ) -> Self::JoinHandle<T>;
+
+    /// Spawn a new local task with 'static lifetime.
+    ///
+    /// *unsafe trait impl: must return a join handle that when awaited awaits for the spawned future to finish.*
+    fn spawn_local_unscoped<T: 'static>(
+        self: Pin<&mut Self>,
+        f: impl Future<Output = T> + 'static,
+    ) -> Self::LocalJoinHandle<T>;
+
+    /// Evaluate future whilst blocking this thread.
+    ///
+    /// *used for handling premature drops*
+    fn block_on<T>(self: Pin<&mut Self>, f: impl Future<Output = T>) -> T;
 }
 
-impl<'scope, R: Default + Send + 'static, Sp: Spawner<R> + Blocker> ScopeExt<'scope>
-    for Scope<'scope, R, Sp>
-{
-    fn lease<'a: 'scope, T: ?Sized>(
-        &mut self,
+/// An anchor to handle safe scoped task spawning and async borrowing contracts.
+///
+/// **failing to `.await` this before dropping will result in performance issues and potential deadlocks**
+#[must_use = "failing to `.await` this before dropping will result in performance issues and potential deadlocks"]
+#[pin_project(PinnedDrop)]
+pub struct Anchor<'env, S: Spawner> {
+    /// Inner spawner that is used to spawn tasks.
+    #[pin]
+    spawner: S,
+    /// Unordered stream containing the futures spawned within this scope.
+    ///
+    /// Will **always** be `Some` outside of `drop`.
+    tasks: Option<futures::stream::FuturesUnordered<S::LocalJoinHandle<()>>>,
+    /// Contravarient lifetime parameter allowing the scope to be broadened.
+    /// Broadening the scope is safe because it only acts to limit what it can borrow.
+    _env: PhantomData<fn(Pin<&'env ()>)>,
+}
+
+impl<'env, S: Spawner> Future for Anchor<'env, S> {
+    type Output = ();
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let projected = self.project();
+        // Will **always** be `Some` outside of `drop`.
+        let tasks = unsafe { projected.tasks.as_mut().unwrap_unchecked() };
+        if let std::task::Poll::Ready(None) = tasks.poll_next_unpin(cx) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+#[pinned_drop]
+impl<'env, S: Spawner> PinnedDrop for Anchor<'env, S> {
+    fn drop(self: Pin<&mut Self>) {
+        let projected = self.project();
+        // Will **always** be `Some` outside of `drop`.
+        let mut tasks = unsafe { projected.tasks.take().unwrap_unchecked() };
+        if tasks.is_empty() {
+            return;
+        }
+        // -----------------
+        // DON'T END UP HERE
+        // -----------------
+        projected
+            .spawner
+            .block_on(async move { while let Some(_) = tasks.next().await {} })
+    }
+}
+
+impl<'env, S: Spawner> Anchor<'env, S> {
+    pub fn new(spawner: S) -> Self {
+        Anchor {
+            spawner,
+            tasks: Some(futures::stream::FuturesUnordered::new()),
+            _env: PhantomData::<fn(Pin<&'env ()>)>,
+        }
+    }
+
+    /// Spawns a new task.
+    ///
+    /// **supports growing of the `'env` lifetime as this can only limit what is spawned.**
+    pub fn spawn(self: Pin<&mut Self>, f: impl Future<Output = ()> + Send + 'env) {
+        let projected = self.project();
+        // Will **always** be `Some` outside of `drop`.
+        let tasks = unsafe { projected.tasks.as_ref().unwrap_unchecked() };
+        type TransSrc<'env> = Pin<Box<dyn Future<Output = ()> + Send + 'env>>;
+        type TransDst = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+        let join_handle = projected.spawner.spawn_unscoped(unsafe {
+            std::mem::transmute::<TransSrc<'env>, TransDst>(Box::pin(f))
+        });
+        tasks.push(<S as Spawner>::localise_handle(join_handle));
+    }
+
+    /// Spawns a new task on the same thread, circumventing the requirement for the future to be `Send`.
+    ///
+    /// **supports growing of the `'env` lifetime as this can only limit what is spawned.**
+    pub fn spawn_local(self: Pin<&mut Self>, f: impl Future<Output = ()> + 'env) {
+        let projected = self.project();
+        // Will **always** be `Some` outside of `drop`.
+        let tasks = unsafe { projected.tasks.as_ref().unwrap_unchecked() };
+        type TransSrc<'env> = Pin<Box<dyn Future<Output = ()> + 'env>>;
+        type TransDst = Pin<Box<dyn Future<Output = ()> + 'static>>;
+        let join_handle = projected.spawner.spawn_local_unscoped(unsafe {
+            std::mem::transmute::<TransSrc<'env>, TransDst>(Box::pin(f))
+        });
+        tasks.push(join_handle);
+    }
+
+    /// Leases immutable access to the memory referenced by `ptr` to arbitrary async tasks using reference counting.
+    ///
+    /// **`'a: 'env` communicates to the type system that `ptr` may be borrowed by `self` or the returned `BorrowHandle`,
+    /// requiring both to be dropped for the borrow to end.**
+    pub fn lease<'a: 'env, T>(
+        self: Pin<&mut Self>,
         ptr: &'a T,
-    ) -> (BorrowGaurd<'scope, 'a, T>, Borrow<T>) {
+    ) -> (BorrowHandle<'a, T>, Borrow<T>) {
         let ptr = NonNull::from(ptr);
         let (lessor, lessee) = create_contract(ptr);
         let (sender, receiver) = futures::channel::oneshot::channel::<()>();
         let borrow = Borrow(lessee);
-        let gaurd = BorrowGaurd {
+        let handle = BorrowHandle {
             original: ptr,
             signal: receiver,
             _borrow: PhantomData::<&'a T>,
-            _scope: PhantomData::<fn(&'scope ()) -> &'scope ()>,
         };
         self.spawn(async {
             lessor.await;
             sender.send(()).unwrap_or(());
-            R::default()
         });
-        (gaurd, borrow)
+        (handle, borrow)
     }
 
-    fn lease_mut<'a: 'scope, T: ?Sized>(
-        &mut self,
+    /// Leases mutable access to the memory referenced by `ptr` to arbitrary async tasks using reference counting.
+    ///
+    /// **`'a: 'env` communicates to the type system that `ptr` may be borrowed by `self` or the returned `BorrowHandle`,
+    /// requiring both to be dropped for the borrow to end.**
+    pub fn lease_mut<'a: 'env, T>(
+        self: Pin<&mut Self>,
         ptr: &'a mut T,
-    ) -> (BorrowMutGaurd<'scope, 'a, T>, BorrowMut<T>) {
+    ) -> (BorrowMutHandle<'a, T>, BorrowMut<T>) {
         let ptr = NonNull::from(ptr);
         let (lessor, lessee) = create_contract(ptr);
         let (sender, receiver) = futures::channel::oneshot::channel::<()>();
         let borrow = BorrowMut(lessee);
-        let gaurd = BorrowMutGaurd {
+        let handle = BorrowMutHandle {
             original: ptr,
             signal: receiver,
             _borrow: PhantomData::<&'a mut T>,
-            _scope: PhantomData::<fn(&'scope ()) -> &'scope ()>,
         };
         self.spawn(async {
             lessor.await;
             sender.send(()).unwrap_or(());
-            R::default()
         });
-        (gaurd, borrow)
+        (handle, borrow)
     }
 
-    fn pinning_lease<'a: 'scope, T: ?Sized>(
-        &mut self,
+    /// Leases pinned immutable access to the memory referenced by `ptr` to arbitrary async tasks using reference counting.
+    ///
+    /// **`'a: 'env` communicates to the type system that `ptr` may be borrowed by `self` or the returned `BorrowHandle`,
+    /// requiring both to be dropped for the borrow to end.**
+    pub fn lease_pinned<'a: 'env, T>(
+        self: Pin<&mut Self>,
         ptr: Pin<&'a T>,
-    ) -> (PinningBorrowGaurd<'scope, 'a, T>, Pin<Borrow<T>>) {
-        let ptr = unsafe { NonNull::from(Pin::into_inner_unchecked(ptr)) };
+    ) -> (PinningBorrowHandle<'a, T>, Pin<Borrow<T>>) {
+        let ptr = NonNull::from(unsafe { Pin::into_inner_unchecked(ptr) });
         let (lessor, lessee) = create_contract(ptr);
         let (sender, receiver) = futures::channel::oneshot::channel::<()>();
         let borrow = unsafe { Pin::new_unchecked(Borrow(lessee)) };
-        let gaurd = PinningBorrowGaurd {
+        let handle = PinningBorrowHandle {
             original: ptr,
             signal: receiver,
             _borrow: PhantomData::<Pin<&'a T>>,
-            _scope: PhantomData::<fn(&'scope ()) -> &'scope ()>,
         };
         self.spawn(async {
             lessor.await;
             sender.send(()).unwrap_or(());
-            R::default()
         });
-        (gaurd, borrow)
+        (handle, borrow)
     }
 
-    fn pinning_lease_mut<'a: 'scope, T: ?Sized>(
-        &mut self,
+    /// Leases pinned mutable access to the memory referenced by `ptr` to arbitrary async tasks using reference counting.
+    ///
+    /// **`'a: 'env` communicates to the type system that `ptr` may be borrowed by `self` or the returned `BorrowHandle`,
+    /// requiring both to be dropped for the borrow to end.**
+    pub fn lease_pinned_mut<'a: 'env, T>(
+        self: Pin<&mut Self>,
         ptr: Pin<&'a mut T>,
-    ) -> (PinningBorrowMutGaurd<'scope, 'a, T>, Pin<BorrowMut<T>>) {
-        let ptr = unsafe { NonNull::from(Pin::into_inner_unchecked(ptr)) };
+    ) -> (PinningBorrowMutHandle<'a, T>, Pin<BorrowMut<T>>) {
+        let ptr = NonNull::from(unsafe { Pin::into_inner_unchecked(ptr) });
         let (lessor, lessee) = create_contract(ptr);
         let (sender, receiver) = futures::channel::oneshot::channel::<()>();
         let borrow = unsafe { Pin::new_unchecked(BorrowMut(lessee)) };
-        let gaurd = PinningBorrowMutGaurd {
+        let handle = PinningBorrowMutHandle {
             original: ptr,
             signal: receiver,
             _borrow: PhantomData::<Pin<&'a mut T>>,
-            _scope: PhantomData::<fn(&'scope ()) -> &'scope ()>,
         };
         self.spawn(async {
             lessor.await;
             sender.send(()).unwrap_or(());
-            R::default()
         });
-        (gaurd, borrow)
+        (handle, borrow)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::ScopeExt;
+// #[cfg(test)]
+// mod tests {
+//     use crate::ScopeExt;
 
-    #[tokio::test]
-    async fn vibe_check() {
-        let mut x: u32 = 0;
-        unsafe {
-            async_scoped::TokioScope::<()>::scope(|scope| {
-                // borrow
-                let (gaurd, mut borrow) = scope.lease_mut(&mut x);
-                // spawn global
-                tokio::task::spawn(async move {
-                    *borrow += 1;
-                });
-                scope.spawn_cancellable(
-                    async move {
-                        // await guard
-                        let rx = gaurd.await;
-                        *rx += 2;
-                    },
-                    Default::default,
-                );
-            })
-            .0
-            .collect()
-            .await
-        };
-    }
-}
+//     #[tokio::test]
+//     async fn vibe_check() {
+//         let mut x: u32 = 0;
+//         unsafe {
+//             async_scoped::TokioScope::<()>::scope(|scope| {
+//                 // borrow
+//                 let (handle, mut borrow) = scope.lease_mut(&mut x);
+//                 // spawn global
+//                 tokio::task::spawn(async move {
+//                     *borrow += 1;
+//                 });
+//                 scope.spawn_cancellable(
+//                     async move {
+//                         // await guard
+//                         let rx = handle.await;
+//                         *rx += 2;
+//                     },
+//                     Default::default,
+//                 );
+//             })
+//             .0
+//             .collect()
+//             .await
+//         };
+//     }
+// }

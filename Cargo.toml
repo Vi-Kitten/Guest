@@ -14,6 +14,7 @@ rust-version = "1.77.1"
 [dependencies]
 async-scoped = "0.9.0"
 futures = "0.3.30"
+pin-project = "1.1.7"
 
 [dev-dependencies]
 tokio = { version = "1.41.0", features = ["full"] }
