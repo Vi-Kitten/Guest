@@ -5,466 +5,124 @@ use std::{
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
     pin::Pin,
-    ptr::{null_mut, NonNull},
     sync::atomic::*,
     task::Waker,
 };
 
-use futures::{stream::FusedStream, FutureExt, Stream, StreamExt};
+use futures::{stream::FusedStream, Stream, StreamExt};
 
-use pin_project::{pin_project, pinned_drop};
+pub mod collections;
 
-/// An async borrowing contract
-///
-/// counter contains the number of current borrows + 1
-///
-/// when the counter is 1 the contract is being terminated by a lessee
-#[derive(Debug)]
-struct Contract {
-    counter: AtomicUsize,
-    waker: UnsafeCell<MaybeUninit<Waker>>,
-    _fragile: PhantomPinned,
+/// A view to the memory that is being borrowed from the perspective of the owner.
+/// 
+/// Borrows the owner mutably.
+struct OwnerView<'owner, T> {
+    /// The pointer to the contract.
+    /// 
+    /// Will never be null.
+    contract: *const Contract<T>,
+    _owner: PhantomData<&'owner mut ()>,
 }
 
-unsafe impl Sync for Contract {}
-
-unsafe impl Send for Contract {}
-
-impl Contract {
-    /// creates a new ontract with the counter equal to 1
-    pub fn new() -> Self {
-        Contract {
-            counter: 1.into(),
-            waker: UnsafeCell::new(MaybeUninit::new(futures::task::noop_waker())),
-            _fragile: PhantomPinned,
-        }
+impl<'owner, T> OwnerView<'owner, T> {
+    pub unsafe fn from_raw(contract: *const Contract<T>) -> Self {
+        OwnerView { contract, _owner: PhantomData }
     }
 
-    /// Tries to set the waker for the contract.
-    ///
-    /// if `Some(())` is returned then the waker was set, otherwise if `None` is returned the contract has been terminated and is ready to drop.
-    ///
-    /// *only the lessor should call this method.*
-    pub unsafe fn set_waker(&self, cx: &mut std::task::Context<'_>) -> Option<()> {
-        let previous = self.counter.fetch_add(1, Ordering::Relaxed);
-        if previous > 1 {
-            // other live references exist, after increment no cleanup can no occur
-            *unsafe {
-                self.waker
-                    .get()
-                    .as_mut()
-                    .unwrap_unchecked()
-                    .assume_init_mut()
-            } = cx.waker().clone();
-
-            let previous = self.counter.fetch_sub(1, Ordering::Relaxed);
-            if previous == 2 {
-                // terminate on last decrement
-                drop(unsafe {
-                    std::mem::replace(
-                        self.waker.get().as_mut().unwrap_unchecked(),
-                        MaybeUninit::uninit(),
-                    )
-                    .assume_init()
-                });
-
-                return None;
-            }
-            return Some(());
-        };
-        if previous == 0 {
-            return None;
-        }
-        // wait for termination to finish
-        while self.count() != 0 {}
-        None
+    pub async fn aquire(self) -> UniqueView<'owner, T> {
+        let contract = self.contract;
+        let _owner = self._owner;
+        self.await;
+        // all borrows are done
+        UniqueView { contract: contract as *mut _, _owner }
     }
 
-    /// Increment without checking if the contract is being terminated.
-    pub(self) unsafe fn increment_unchecked(&self) -> usize {
-        self.counter.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Decrement and start termination if nesacarry.
-    pub(self) fn decrement(&self) {
-        let previous = self.counter.fetch_sub(1, Ordering::Relaxed);
-        if previous == 2 {
-            // terminate on last decrement
-            unsafe {
-                std::mem::replace(
-                    self.waker.get().as_mut().unwrap_unchecked(),
-                    MaybeUninit::uninit(),
-                )
-                .assume_init()
-                .wake();
-            }
-
-            self.counter.store(0, Ordering::Relaxed);
-        }
-    }
-
-    pub(self) fn count(&self) -> usize {
-        self.counter.load(Ordering::Relaxed)
+    pub unsafe fn aquire_unchecked(self) -> UniqueView<'owner, T> {
+        UniqueView { contract: self.contract as *mut _, _owner: self._owner }
     }
 }
 
-/// A wrapper over the `Contract` type representing the lessor.
-///
-/// Awaiting will wait until borrows end.
-///
-/// **Pre-mature dropping will break aliasing rules.**
-#[must_use = "pre-mature dropping will break aliasing rules"]
-struct Lessor {
-    contract: *mut Contract,
-}
-
-unsafe impl Sync for Lessor {}
-
-unsafe impl Send for Lessor {}
-
-impl Future for Lessor {
+impl<'owner, T> Future for OwnerView<'owner, T> {
     type Output = ();
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let Some(contract) = (unsafe { self.contract.as_ref() }) else {
-            return std::task::Poll::Ready(());
-        };
-        if let Some(()) = unsafe { contract.set_waker(cx) } {
-            return std::task::Poll::Pending;
-        };
-        drop(unsafe { Box::from_raw(self.contract) });
-        self.contract = null_mut();
-        std::task::Poll::Ready(())
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        match unsafe { self.contract.as_ref().unwrap_unchecked().try_set_waker(cx) } {
+            // waker was set, so we are not done
+            Some(_) => std::task::Poll::Pending,
+            // waker was not set, so we are done
+            None => std::task::Poll::Ready(()),
+        }
     }
 }
 
-// impl Drop for Lessor {
-//     fn drop(&mut self) {
-//         if !self.contract.is_null() {
-//             // -----------------
-//             // DON'T END UP HERE
-//             // -----------------
-//             let lease = Lessor {
-//                 contract: self.contract,
-//             };
-//             tokio::task::block_in_place(|| {
-//                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
-//                     handle.block_on(lease)
-//                 } else {
-//                     let rt = tokio::runtime::Builder::new_current_thread()
-//                         .build()
-//                         .unwrap();
-//                     rt.block_on(lease)
-//                 }
-//             })
-//         }
-//     }
-// }
-
-/// A wrapper over the `Contract` type representing the lessee.
-///
-/// Uses a reference count to borrow.
-#[pin_project(PinnedDrop)]
-struct Lessee<T: ?Sized> {
-    contract: NonNull<Contract>,
-    #[pin]
-    ptr: NonNull<T>,
+/// A view to an inactive contract from the perspective of the owner.
+/// 
+/// Borrows the owner mutably.
+struct UniqueView<'owner, T> {
+    /// The pointer to the contract.
+    /// 
+    /// Will never be null.
+    contract: *mut Contract<T>,
+    _owner: PhantomData<&'owner mut ()>,
 }
 
-impl<T: ?Sized> Lessee<T> {
-    pub fn is_unique(&self) -> bool {
-        unsafe { self.contract.as_ref().count() == 2 }
-    }
-
+impl<'owner, T> UniqueView<'owner, T> {
     pub fn as_ref(&self) -> &T {
-        unsafe { self.ptr.as_ref() }
+        unsafe { self.contract.as_ref().unwrap_unchecked().as_ref() }
+    }
+
+    pub fn as_mut(&mut self) -> &mut T {
+        unsafe { self.contract.as_ref().unwrap_unchecked().as_mut() }
+    }
+
+    pub fn share(self) -> (OwnerView<'owner, T>, VisitorView<T>) {
+        let _owner = self._owner;
+        unsafe { self.contract.as_mut().unwrap_unchecked().init_visitor() };
+        let contract = self.contract as *const _;
+        (OwnerView { contract, _owner }, VisitorView { contract })
+    }
+
+    pub fn as_owner(self) -> OwnerView<'owner, T> {
+        OwnerView { contract: self.contract, _owner: self._owner }
+    }
+}
+
+/// A view to the memory that is being borrowed from the perspective of the visitor.
+struct VisitorView<T> {
+    /// The pointer to the contract.
+    /// 
+    /// Will never be null.
+    contract: *const Contract<T>,
+}
+
+impl<T> VisitorView<T> {
+    pub fn as_ref(&self) -> &T {
+        unsafe { self.contract.as_ref().unwrap_unchecked().as_ref() }
     }
 
     pub unsafe fn as_mut(&mut self) -> &mut T {
-        unsafe { self.ptr.as_mut() }
+        unsafe { self.contract.as_ref().unwrap_unchecked().as_mut() }
     }
 }
 
-impl<T: ?Sized> Clone for Lessee<T> {
+impl<T> Clone for VisitorView<T> {
     fn clone(&self) -> Self {
-        unsafe { self.contract.as_ref().increment_unchecked() };
-        Self {
-            contract: self.contract.clone(),
-            ptr: self.ptr.clone(),
-        }
+        unsafe { self.contract.as_ref().unwrap_unchecked().increment_unchecked() };
+        VisitorView { contract: self.contract }
     }
 }
 
-#[pinned_drop]
-impl<T: ?Sized> PinnedDrop for Lessee<T> {
-    fn drop(self: Pin<&mut Self>) {
-        unsafe { self.project().contract.as_ref().decrement() };
-    }
-}
-
-fn create_contract<T: ?Sized>(ptr: NonNull<T>) -> (Lessor, Lessee<T>) {
-    let contract = Box::new(Contract::new());
-    unsafe { contract.increment_unchecked() };
-    let contract = Box::into_raw(contract);
-    // // occursed testing things
-    // unsafe {
-    //     let bingle: usize = contract as usize;
-    //     std::thread::spawn(move || {
-    //         for _ in 0..100 {
-    //             let contract: *const Contract = bingle as *const Contract;
-    //             println!("{:?}", contract.as_ref().unwrap());
-    //         }
-    //     });
-    // };
-    (
-        Lessor { contract },
-        Lessee {
-            contract: unsafe { NonNull::new_unchecked(contract) },
-            ptr,
-        },
-    )
-}
-
-pub struct Borrow<T: ?Sized>(pub(self) Lessee<T>);
-
-unsafe impl<T: ?Sized + Sync> Sync for Borrow<T> {}
-
-unsafe impl<T: ?Sized + Sync> Send for Borrow<T> {}
-
-impl<T: ?Sized> Deref for Borrow<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
-pub struct UpgradableBorrow<T: ?Sized>(pub(self) Lessee<T>);
-
-unsafe impl<T: ?Sized + Sync> Sync for UpgradableBorrow<T> {}
-
-unsafe impl<T: ?Sized + Sync + Send> Send for UpgradableBorrow<T> {}
-
-impl<T: ?Sized> Deref for UpgradableBorrow<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
-impl<T: ?Sized> UpgradableBorrow<T> {
-    /// Tries to upgrade the borrow.
-    ///
-    /// *can fail even if unique because of how polling works.*
-    pub fn try_upgrade(UpgradableBorrow(lessee): Self) -> Result<BorrowMut<T>, Self> {
-        if lessee.is_unique() {
-            Ok(BorrowMut(lessee))
-        } else {
-            Err(UpgradableBorrow(lessee))
-        }
-    }
-
-    /// Tries to upgrade the pinned borrow.
-    ///
-    /// *can fail even if unique because of how polling works.*
-    pub fn try_upgrade_pinned(borrow: Pin<Self>) -> Result<Pin<BorrowMut<T>>, Pin<Self>> {
-        match unsafe { Self::try_upgrade(Pin::into_inner_unchecked(borrow)) } {
-            Ok(upgraded) => unsafe { Ok(Pin::new_unchecked(upgraded)) },
-            Err(borrow) => unsafe { Err(Pin::new_unchecked(borrow)) },
-        }
-    }
-}
-
-pub struct BorrowMut<T: ?Sized>(pub(self) Lessee<T>);
-
-unsafe impl<T: ?Sized + Sync> Sync for BorrowMut<T> {}
-
-unsafe impl<T: ?Sized + Send> Send for BorrowMut<T> {}
-
-impl<T: ?Sized> Deref for BorrowMut<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
-impl<T: ?Sized> DerefMut for BorrowMut<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.0.as_mut() }
-    }
-}
-
-impl<T: ?Sized> From<BorrowMut<T>> for UpgradableBorrow<T> {
-    fn from(BorrowMut(lessee): BorrowMut<T>) -> Self {
-        UpgradableBorrow(lessee)
-    }
-}
-
-impl<T: ?Sized> From<BorrowMut<T>> for Borrow<T> {
-    fn from(BorrowMut(lessee): BorrowMut<T>) -> Self {
-        Borrow(lessee)
-    }
-}
-
-impl<T: ?Sized> From<UpgradableBorrow<T>> for Borrow<T> {
-    fn from(UpgradableBorrow(lessee): UpgradableBorrow<T>) -> Self {
-        Borrow(lessee)
-    }
-}
-
-pub struct BorrowHandle<'a, T: ?Sized> {
-    original: NonNull<T>,
-    signal: futures::channel::oneshot::Receiver<()>,
-    _borrow: PhantomData<&'a T>,
-}
-
-unsafe impl<'a, T: ?Sized + Sync> Sync for BorrowHandle<'a, T> {}
-
-unsafe impl<'a, T: ?Sized + Sync> Send for BorrowHandle<'a, T> {}
-
-impl<'a, T: ?Sized> Future for BorrowHandle<'a, T> {
-    type Output = &'a T;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        self.signal
-            .poll_unpin(cx)
-            .map(|_| unsafe { self.original.as_ref() })
-    }
-}
-
-pub struct BorrowMutHandle<'a, T: ?Sized> {
-    original: NonNull<T>,
-    signal: futures::channel::oneshot::Receiver<()>,
-    _borrow: PhantomData<&'a mut T>,
-}
-
-unsafe impl<'a, T: ?Sized + Sync> Sync for BorrowMutHandle<'a, T> {}
-
-unsafe impl<'a, T: ?Sized + Send> Send for BorrowMutHandle<'a, T> {}
-
-impl<'a, T: ?Sized> Future for BorrowMutHandle<'a, T> {
-    type Output = &'a mut T;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        self.signal
-            .poll_unpin(cx)
-            .map(|_| unsafe { self.original.as_mut() })
-    }
-}
-
-pub struct PinningBorrowHandle<'a, T: ?Sized> {
-    original: NonNull<T>,
-    signal: futures::channel::oneshot::Receiver<()>,
-    _borrow: PhantomData<Pin<&'a T>>,
-}
-
-unsafe impl<'a, T: ?Sized + Sync> Sync for PinningBorrowHandle<'a, T> {}
-
-unsafe impl<'a, T: ?Sized + Sync> Send for PinningBorrowHandle<'a, T> {}
-
-impl<'a, T: ?Sized> Future for PinningBorrowHandle<'a, T> {
-    type Output = Pin<&'a T>;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        self.signal
-            .poll_unpin(cx)
-            .map(|_| unsafe { Pin::new_unchecked(self.original.as_ref()) })
-    }
-}
-
-pub struct PinningBorrowMutHandle<'a, T: ?Sized> {
-    original: NonNull<T>,
-    signal: futures::channel::oneshot::Receiver<()>,
-    _borrow: PhantomData<Pin<&'a mut T>>,
-}
-
-unsafe impl<'a, T: ?Sized + Sync> Sync for PinningBorrowMutHandle<'a, T> {}
-
-unsafe impl<'a, T: ?Sized + Send> Send for PinningBorrowMutHandle<'a, T> {}
-
-impl<'a, T: ?Sized> Future for PinningBorrowMutHandle<'a, T> {
-    type Output = Pin<&'a mut T>;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        self.signal
-            .poll_unpin(cx)
-            .map(|_| unsafe { Pin::new_unchecked(self.original.as_mut()) })
-    }
-}
-
-pub struct Owner<T> {
-    share: ShareWrapper<T>,
-}
-
-struct ShareWrapper<T> {
-    inner: NonNull<WeakShare<T>>,
-}
-
-impl<T> Deref for ShareWrapper<T> {
-    type Target = WeakShare<T>;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.inner.as_ref() }
-    }
-}
-
-impl<T> Clone for ShareWrapper<T> {
-    fn clone(&self) -> Self {
-        self.log_reference();
-        ShareWrapper { inner: self.inner }
-    }
-}
-
-impl<T> Drop for ShareWrapper<T> {
+impl<T> Drop for VisitorView<T> {
     fn drop(&mut self) {
-        if self.unlog_reference() == 1 {
-            drop(unsafe { Box::from_raw(self.inner.as_ptr()) })
-        }
+        unsafe { self.contract.as_ref().unwrap_unchecked().decrement() };
     }
 }
 
-struct WeakShare<T> {
-    /// Reference count (including owner)
-    refs: AtomicUsize,
-    share: Share<T>,
-}
-
-impl<T> WeakShare<T> {
-    fn log_reference(&self) -> usize {
-        self.refs.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn unlog_reference(&self) -> usize {
-        self.refs.fetch_sub(1, Ordering::Relaxed)
-    }
-}
-
-impl<T> Deref for WeakShare<T> {
-    type Target = Share<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.share
-    }
-}
-
-struct Share<T> {
+/// Represents a contract allowing memory borrowing using async/await.
+/// 
+/// Even in the case of direct ownership, no &mut can touch the memory to prevent aliasing issues unless all borrows have ended.
+#[derive(Debug)]
+struct Contract<T> {
     /// The number of borrows plus 1.
     /// If the counter is 1 then the waker is considered to be aquired.
     counter: AtomicUsize,
@@ -475,167 +133,385 @@ struct Share<T> {
     /// May be modified based on counter state:
     ///
     /// ```no_run
-    /// +----+----------------+---------------+-------------------+
-    /// | 0  | ------- : ---- | &owner : read | &mut owner : &mut |
-    /// +----+----------------+---------------+-------------------+
-    /// | 1  | visitor : &mut | &owner :  ><  | &mut owner :  ><  |
-    /// +----+----------------+---------------+-------------------+
-    /// | 2+ | visitor :  ><  | &owner : read | &mut owner : &mut |
-    /// +----+----------------+---------------+-------------------+
+    /// +----+--------------+------------+
+    /// | 0  | ------- : -- | owner : ^/ |
+    /// +----+--------------+------------+
+    /// | 1  | visitor : ^/ | owner : >< |
+    /// +----+--------------+------------+
+    /// | 2+ | visitor : >< | owner : ^/ |
+    /// +----+--------------+------------+
     /// ```
     waker: UnsafeCell<MaybeUninit<Waker>>,
-    /// Flag for specifying if memory is mutable.
+    /// The stored value that is being borrowed.
     ///
-    /// **must be false if counter is 0.**
+    /// May be modified based on counter state:
     ///
-    /// May be accessed based on counter state:
     /// ```no_run
-    /// +----+----------------+---------------+-------------------+
-    /// | 0  | ------- : ---- | &owner : read | &mut owner : &mut |
-    /// +----+----------------+---------------+-------------------+
-    /// | 1  | visitor : &mut | &owner :  ><  | &mut owner :  ><  |
-    /// +----+----------------+---------------+-------------------+
-    /// | 2+ | visitor : read | &owner : read | &mut owner : read |
-    /// +----+----------------+---------------+-------------------+
+    /// +----+--------------+------------+
+    /// | 0  | ------- : -- | owner : ^/ |
+    /// +----+--------------+------------+
+    /// | 1  | visitor : >< | owner : >< |
+    /// +----+--------------+------------+
+    /// | 2+ | visitor : ^/ | owner : >< |
+    /// +----+--------------+------------+
     /// ```
-    is_mut: UnsafeCell<bool>,
-    _shared: PhantomPinned,
     val: UnsafeCell<MaybeUninit<T>>,
+    _shared: PhantomPinned,
 }
 
-impl<T> Share<T> {
+impl<T> Contract<T> {
+    pub fn new(val: T) -> Self {
+        Contract {
+            counter: AtomicUsize::new(0),
+            waker: UnsafeCell::new(MaybeUninit::uninit()),
+            _shared: PhantomPinned,
+            val: UnsafeCell::new(MaybeUninit::new(val)),
+        }
+    }
+
     /// Increment the count assuming there is a non-dropping visitor currently allocated.
     ///
     /// **only visitors may safely call.**
-    unsafe fn increment_unchecked(&self) -> usize {
+    pub unsafe fn increment_unchecked(&self) -> usize {
         self.counter.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Read `is_mut` assuming there is a non-dropping visitor currently allocated.
+    /// Increment the count to aquire unique access and set the waker.
+    /// 
+    /// **owner must be unique.**
+    pub unsafe fn try_set_waker(&self, cx: &mut std::task::Context<'_>) -> Option<()> {
+        loop {
+            let n = self.counter.load(Ordering::Relaxed);
+            if n == 0 {
+                // no visitors
+                return None;
+            }
+            if n == 1 {
+                // already aquired
+                continue;
+            }
+            if let Err(_) = self.counter.compare_exchange(n, n + 1, Ordering::Acquire, Ordering::Relaxed) {
+                // exchange failed
+                continue;
+            }
+            // gaurded against drop
+            unsafe {
+                // go go sanchez skii shoes
+                *self.waker.get().as_mut().unwrap_unchecked().assume_init_mut() = cx.waker().clone();
+            }
+            // release the counter
+            self.counter.store(n, Ordering::Release);
+            break Some(());
+        }
+    }
+
+    /// Initlize the contract with a visitor and a noop waker.
     ///
-    /// **only visitors may safely call.**
-    unsafe fn check_mut_unchecked(&self) -> bool {
-        unsafe { *NonNull::new_unchecked(self.is_mut.get()).as_ref() }
+    /// *will fail to drop waker if the counter is not 0.*
+    pub fn init_visitor(&mut self) {
+        self.counter = 2.into();
+        *self.waker.get_mut() = MaybeUninit::new(futures::task::noop_waker());
     }
 
-    unsafe fn get_is_mut(&self) -> bool {
-        todo!()
+    pub unsafe fn as_ref(&self) -> &T {
+        unsafe { self.val.get().as_ref().unwrap_unchecked().assume_init_ref() }
     }
 
-    unsafe fn set_is_mut(&self, new: bool) {
-        todo!()
+    pub unsafe fn as_mut(&self) -> &mut T {
+        unsafe { self.val.get().as_mut().unwrap_unchecked().assume_init_mut() }
     }
 
-    unsafe fn as_ref(&self) -> &T {
-        todo!()
-    }
-
-    unsafe fn as_mut(&self) -> &mut T {
-        todo!()
-    }
-
-    fn increment(&self, waker_gen: impl FnOnce() -> Waker) -> usize {
-        let n = loop {
+    #[allow(unused)]
+    pub fn increment(&self) -> usize {
+        loop {
             let n = self.counter.load(Ordering::Relaxed);
             if n == 1 {
                 continue;
             }
-            let success_ordering = if n == 0 {
-                Ordering::Acquire
+            if n == 0 {
+                match self
+                    .counter
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                {
+                    Ok(_) => {
+                        unsafe {
+                                self.waker.get().as_mut().unwrap_unchecked().write(futures::task::noop_waker());
+                        }
+                        self.counter.store(2, Ordering::Release);
+                        break 0;
+                    },
+                    Err(_) => continue,
+                }
             } else {
-                Ordering::Relaxed
+                match self
+                    .counter
+                    .compare_exchange(n, n + 1, Ordering::Relaxed, Ordering::Relaxed)
+                {
+                    Ok(_) => break n,
+                    Err(_) => continue,
+                }
             };
-            match self
-                .counter
-                .compare_exchange(n, n + 1, success_ordering, Ordering::Relaxed)
-            {
-                Ok(_) => break n,
-                Err(_) => continue,
-            }
             #[allow(unreachable_code)]
             {
                 unreachable!()
             }
-        };
-        if n == 0 {
-            unsafe {
-                drop(std::mem::replace(
-                    NonNull::new_unchecked(self.waker.get()).as_mut(),
-                    MaybeUninit::new((waker_gen)()),
-                ))
-            }
-            self.counter.store(2, Ordering::Release);
-        };
-        n
+        }
     }
 
-    fn decrement(&self) -> usize {
-        let n = loop {
+    pub fn decrement(&self) -> usize {
+        loop {
             let n = self.counter.load(Ordering::Relaxed);
             if n == 1 {
                 continue;
             }
-            let success_ordering = if n == 2 {
-                Ordering::Acquire
+            if n == 2 {
+                match self
+                    .counter
+                    .compare_exchange(2, 1, Ordering::Acquire, Ordering::Relaxed)
+                {
+                    Ok(_) => {
+                        unsafe {
+                            std::mem::replace(
+                                self.waker.get().as_mut().unwrap_unchecked(),
+                                MaybeUninit::uninit(),
+                            )
+                            .assume_init()
+                            .wake();
+                        };
+                        self.counter.store(0, Ordering::Release);
+                        break n;
+                    },
+                    Err(_) => continue,
+                }
             } else {
-                Ordering::Relaxed
+                match self
+                    .counter
+                    .compare_exchange(n, n - 1, Ordering::Release, Ordering::Relaxed)
+                {
+                    Ok(_) => break n,
+                    Err(_) => continue,
+                }
             };
-            match self
-                .counter
-                .compare_exchange(n, n - 1, success_ordering, Ordering::Relaxed)
-            {
-                Ok(_) => break n,
-                Err(_) => continue,
-            }
             #[allow(unreachable_code)]
             {
                 unreachable!()
             }
-        };
-        if n == 2 {
-            unsafe {
-                std::mem::replace(
-                    NonNull::new_unchecked(self.waker.get()).as_mut(),
-                    MaybeUninit::uninit(),
-                )
-                .assume_init()
-                .wake();
-            };
-            *unsafe { NonNull::new_unchecked(self.is_mut.get()).as_mut() } = false;
-            self.counter.store(0, Ordering::Release);
-        }
-        n
-    }
-
-    /// Tries to borrow the share.
-    ///
-    /// Fails is currently borrowed mutably.
-    pub fn try_borrow_ref(&self) -> Option<NonNull<Self>> {
-        // Create visitor
-        self.increment(futures::task::noop_waker);
-        if unsafe { self.check_mut_unchecked() } {
-            // Delete visitor if invalid
-            self.decrement();
-            None
-        } else {
-            // Return borrow
-            Some(unsafe { NonNull::new_unchecked((self as *const Self) as *mut Self) })
         }
     }
 
-    /// Try borrow the share mutably.
-    ///
-    /// Only works when count is 0.
-    pub fn try_borrow_mut(&self) -> Option<NonNull<Self>> {
-        if let Err(_) = self
+    pub unsafe fn take_val(&self) -> T {
+        std::mem::replace(self.val.get().as_mut().unwrap_unchecked(), MaybeUninit::uninit()).assume_init()
+    }
+}
+
+
+pub struct Ref<T> {
+    visitor: VisitorView<T>,
+}
+
+unsafe impl<T: Sync> Sync for Ref<T> {}
+
+unsafe impl<T: Sync> Send for Ref<T> {}
+
+
+impl<T> Deref for Ref<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self
+            .visitor
+            .contract
+            .as_ref()
+            .unwrap_unchecked()
+            .val
+            .get()
+            .as_ref()
+            .unwrap_unchecked()
+            .assume_init_ref()
+        }
+    }
+}
+
+impl<T> Clone for Ref<T> {
+    fn clone(&self) -> Self {
+        Ref { visitor: self.visitor.clone() }
+    }
+}
+pub struct UpgRef<T> {
+    visitor: VisitorView<T>,
+}
+
+unsafe impl<T: Sync> Sync for UpgRef<T> {}
+
+unsafe impl<T: Sync> Send for UpgRef<T> {}
+
+impl<T> Deref for UpgRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self
+            .visitor
+            .contract
+            .as_ref()
+            .unwrap_unchecked()
+            .val
+            .get()
+            .as_ref()
+            .unwrap_unchecked()
+            .assume_init_ref()
+        }
+    }
+}
+
+impl<T> UpgRef<T> {
+    pub fn upgrade(self) -> Result<RefMut<T>, Self> where T: Send {
+        match unsafe { self
+            .visitor
+            .contract
+            .as_ref()
+            .unwrap_unchecked()
             .counter
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        {
-            return None;
+            .compare_exchange(2, 2, Ordering::Acquire, Ordering::Relaxed)
+        } {
+            Ok(_) => Ok(RefMut { visitor: self.visitor }),
+            Err(_) => Err(self),
         }
-        *unsafe { NonNull::new_unchecked(self.is_mut.get()).as_mut() } = true;
-        self.counter.store(2, Ordering::Release);
-        Some(unsafe { NonNull::new_unchecked((self as *const Self) as *mut Self) })
+    }
+
+    pub fn as_ref(self) -> Ref<T> {
+        Ref { visitor: self.visitor }
+    }
+}
+
+impl<T> Clone for RefMut<T> {
+    fn clone(&self) -> Self {
+        RefMut { visitor: self.visitor.clone() }
+    }
+}
+
+pub struct RefMut<T> {
+    visitor: VisitorView<T>,
+}
+
+unsafe impl<T: Sync> Sync for RefMut<T> {}
+
+unsafe impl<T: Send> Send for RefMut<T> {}
+
+impl<T> Deref for RefMut<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self
+            .visitor
+            .contract
+            .as_ref()
+            .unwrap_unchecked()
+            .val
+            .get()
+            .as_ref()
+            .unwrap_unchecked()
+            .assume_init_ref()
+        }
+    }
+}
+
+impl<T> DerefMut for RefMut<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self
+            .visitor
+            .contract
+            .as_ref()
+            .unwrap_unchecked()
+            .val
+            .get()
+            .as_mut()
+            .unwrap_unchecked()
+            .assume_init_mut()
+        }
+    }
+}
+
+impl<T> RefMut<T> {
+    pub fn downgrade(self) -> UpgRef<T> {
+        UpgRef { visitor: self.visitor }
+    }
+
+    pub fn as_ref(self) -> Ref<T> {
+        Ref { visitor: self.visitor }
+    }
+}
+
+impl<T> From<RefMut<T>> for Ref<T> {
+    fn from(value: RefMut<T>) -> Self {
+        value.as_ref()
+    }
+}
+
+impl<T> From<UpgRef<T>> for Ref<T> {
+    fn from(value: UpgRef<T>) -> Self {
+        value.as_ref()
+    }
+}
+
+pub struct Share<'owner, T> {
+    owner: OwnerView<'owner, T>
+}
+
+impl<'owner, T> Share<'owner, T> {
+    pub async fn aquire(self) -> Borrow<'owner, T> {
+        Borrow { unique: self.owner.aquire().await }
+    }
+
+    pub(crate) unsafe fn aquire_unchecked(self) -> Borrow<'owner, T> {
+        Borrow { unique: self.owner.aquire_unchecked() }
+    }
+
+    pub fn from_unique(unique: Borrow<'owner, T>) -> Self {
+        Self { owner: unique.unique.as_owner() }
+    }
+}
+
+impl<'owner, T> From<Borrow<'owner, T>> for Share<'owner, T> {
+    fn from(unique: Borrow<'owner, T>) -> Self {
+        Self::from_unique(unique)
+    }
+}
+
+pub struct Borrow<'owner, T> {
+    unique: UniqueView<'owner, T>
+}
+
+impl<'owner, T> Borrow<'owner, T> {
+    pub fn borrow_ref(self) -> (Share<'owner, T>, Ref<T>) {
+        let (owner, visitor) = self.unique.share();
+        (Share { owner }, Ref { visitor })
+    }
+
+    pub fn borrow_mut(self) -> (Share<'owner, T>, RefMut<T>) {
+        let (owner, visitor) = self.unique.share();
+        (Share { owner }, RefMut { visitor })
+    }
+
+    pub fn as_ref(self) -> Ref<T> {
+        self.borrow_ref().1
+    }
+
+    pub fn as_mut(self) -> RefMut<T> {
+        self.borrow_mut().1
+    }
+}
+
+impl<'owner, T> Deref for Borrow<'owner, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.unique.as_ref()
+    }
+}
+
+impl<'owner, T> DerefMut for Borrow<'owner, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.unique.as_mut()
     }
 }
 
