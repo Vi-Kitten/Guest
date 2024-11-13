@@ -10,7 +10,7 @@ use std::{
     task::Waker,
 };
 
-use futures::{FutureExt, StreamExt};
+use futures::{stream::FusedStream, FutureExt, Stream, StreamExt};
 
 use pin_project::{pin_project, pinned_drop};
 
@@ -409,255 +409,389 @@ impl<'a, T: ?Sized> Future for PinningBorrowMutHandle<'a, T> {
     }
 }
 
-/// *trait is unsafe as the expectation that awaiting the returned future will await provided future
-/// cannot be expressed within the type system.*
-pub unsafe trait Spawner {
-    type JoinHandle<T: Send + 'static>: Future<Output = T> + Send + 'static;
-
-    type LocalJoinHandle<T: 'static>: Future<Output = T> + 'static;
-
-    /// Monomorphise handle types.
-    fn localise_handle<T: Send + 'static>(handle: Self::JoinHandle<T>) -> Self::LocalJoinHandle<T>;
-
-    /// Spawn a new task with 'static lifetime.
-    ///
-    /// *unsafe trait impl: must return a join handle that when awaited awaits for the spawned future to finish.*
-    fn spawn_unscoped<T: Send + 'static>(
-        self: Pin<&mut Self>,
-        f: impl Future<Output = T> + Send + 'static,
-    ) -> Self::JoinHandle<T>;
-
-    /// Spawn a new local task with 'static lifetime.
-    ///
-    /// *unsafe trait impl: must return a join handle that when awaited awaits for the spawned future to finish.*
-    fn spawn_local_unscoped<T: 'static>(
-        self: Pin<&mut Self>,
-        f: impl Future<Output = T> + 'static,
-    ) -> Self::LocalJoinHandle<T>;
-
-    /// Evaluate future whilst blocking this thread.
-    ///
-    /// *used for handling premature drops*
-    fn block_on<T>(self: Pin<&mut Self>, f: impl Future<Output = T>) -> T;
+pub struct Owner<T> {
+    share: ShareWrapper<T>,
 }
 
-/// An anchor to handle safe scoped task spawning and async borrowing contracts.
-///
-/// **failing to `.await` this before dropping will result in performance issues and potential deadlocks**
-#[must_use = "failing to `.await` this before dropping will result in performance issues and potential deadlocks"]
-#[pin_project(PinnedDrop)]
-pub struct Anchor<'env, S: Spawner> {
-    /// Inner spawner that is used to spawn tasks.
-    #[pin]
-    spawner: S,
-    /// Unordered stream containing the futures spawned within this scope.
-    ///
-    /// Will **always** be `Some` outside of `drop`.
-    tasks: Option<futures::stream::FuturesUnordered<S::LocalJoinHandle<()>>>,
-    /// Contravarient lifetime parameter allowing the scope to be broadened.
-    /// Broadening the scope is safe because it only acts to limit what it can borrow.
-    _env: PhantomData<fn(Pin<&'env ()>)>,
+struct ShareWrapper<T> {
+    inner: NonNull<WeakShare<T>>,
 }
 
-impl<'env, S: Spawner> Future for Anchor<'env, S> {
-    type Output = ();
+impl<T> Deref for ShareWrapper<T> {
+    type Target = WeakShare<T>;
 
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let projected = self.project();
-        // Will **always** be `Some` outside of `drop`.
-        let tasks = unsafe { projected.tasks.as_mut().unwrap_unchecked() };
-        if let std::task::Poll::Ready(None) = tasks.poll_next_unpin(cx) {
-            std::task::Poll::Ready(())
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.inner.as_ref() }
+    }
+}
+
+impl<T> Clone for ShareWrapper<T> {
+    fn clone(&self) -> Self {
+        self.log_reference();
+        ShareWrapper { inner: self.inner }
+    }
+}
+
+impl<T> Drop for ShareWrapper<T> {
+    fn drop(&mut self) {
+        if self.unlog_reference() == 1 {
+            drop(unsafe { Box::from_raw(self.inner.as_ptr()) })
+        }
+    }
+}
+
+struct WeakShare<T> {
+    /// Reference count (including owner)
+    refs: AtomicUsize,
+    share: Share<T>,
+}
+
+impl<T> WeakShare<T> {
+    fn log_reference(&self) -> usize {
+        self.refs.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn unlog_reference(&self) -> usize {
+        self.refs.fetch_sub(1, Ordering::Relaxed)
+    }
+}
+
+impl<T> Deref for WeakShare<T> {
+    type Target = Share<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.share
+    }
+}
+
+struct Share<T> {
+    /// The number of borrows plus 1.
+    /// If the counter is 1 then the waker is considered to be aquired.
+    counter: AtomicUsize,
+    /// The waker for alerting the owner that the borrow is over.
+    ///
+    /// **must be unset if counter is 0 and set if counter is 2+.**
+    ///
+    /// May be modified based on counter state:
+    ///
+    /// ```no_run
+    /// +----+----------------+---------------+-------------------+
+    /// | 0  | ------- : ---- | &owner : read | &mut owner : &mut |
+    /// +----+----------------+---------------+-------------------+
+    /// | 1  | visitor : &mut | &owner :  ><  | &mut owner :  ><  |
+    /// +----+----------------+---------------+-------------------+
+    /// | 2+ | visitor :  ><  | &owner : read | &mut owner : &mut |
+    /// +----+----------------+---------------+-------------------+
+    /// ```
+    waker: UnsafeCell<MaybeUninit<Waker>>,
+    /// Flag for specifying if memory is mutable.
+    ///
+    /// **must be false if counter is 0.**
+    ///
+    /// May be accessed based on counter state:
+    /// ```no_run
+    /// +----+----------------+---------------+-------------------+
+    /// | 0  | ------- : ---- | &owner : read | &mut owner : &mut |
+    /// +----+----------------+---------------+-------------------+
+    /// | 1  | visitor : &mut | &owner :  ><  | &mut owner :  ><  |
+    /// +----+----------------+---------------+-------------------+
+    /// | 2+ | visitor : read | &owner : read | &mut owner : read |
+    /// +----+----------------+---------------+-------------------+
+    /// ```
+    is_mut: UnsafeCell<bool>,
+    _shared: PhantomPinned,
+    val: UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<T> Share<T> {
+    /// Increment the count assuming there is a non-dropping visitor currently allocated.
+    ///
+    /// **only visitors may safely call.**
+    unsafe fn increment_unchecked(&self) -> usize {
+        self.counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Read `is_mut` assuming there is a non-dropping visitor currently allocated.
+    ///
+    /// **only visitors may safely call.**
+    unsafe fn check_mut_unchecked(&self) -> bool {
+        unsafe { *NonNull::new_unchecked(self.is_mut.get()).as_ref() }
+    }
+
+    unsafe fn get_is_mut(&self) -> bool {
+        todo!()
+    }
+
+    unsafe fn set_is_mut(&self, new: bool) {
+        todo!()
+    }
+
+    unsafe fn as_ref(&self) -> &T {
+        todo!()
+    }
+
+    unsafe fn as_mut(&self) -> &mut T {
+        todo!()
+    }
+
+    fn increment(&self, waker_gen: impl FnOnce() -> Waker) -> usize {
+        let n = loop {
+            let n = self.counter.load(Ordering::Relaxed);
+            if n == 1 {
+                continue;
+            }
+            let success_ordering = if n == 0 {
+                Ordering::Acquire
+            } else {
+                Ordering::Relaxed
+            };
+            match self
+                .counter
+                .compare_exchange(n, n + 1, success_ordering, Ordering::Relaxed)
+            {
+                Ok(_) => break n,
+                Err(_) => continue,
+            }
+            #[allow(unreachable_code)]
+            {
+                unreachable!()
+            }
+        };
+        if n == 0 {
+            unsafe {
+                drop(std::mem::replace(
+                    NonNull::new_unchecked(self.waker.get()).as_mut(),
+                    MaybeUninit::new((waker_gen)()),
+                ))
+            }
+            self.counter.store(2, Ordering::Release);
+        };
+        n
+    }
+
+    fn decrement(&self) -> usize {
+        let n = loop {
+            let n = self.counter.load(Ordering::Relaxed);
+            if n == 1 {
+                continue;
+            }
+            let success_ordering = if n == 2 {
+                Ordering::Acquire
+            } else {
+                Ordering::Relaxed
+            };
+            match self
+                .counter
+                .compare_exchange(n, n - 1, success_ordering, Ordering::Relaxed)
+            {
+                Ok(_) => break n,
+                Err(_) => continue,
+            }
+            #[allow(unreachable_code)]
+            {
+                unreachable!()
+            }
+        };
+        if n == 2 {
+            unsafe {
+                std::mem::replace(
+                    NonNull::new_unchecked(self.waker.get()).as_mut(),
+                    MaybeUninit::uninit(),
+                )
+                .assume_init()
+                .wake();
+            };
+            *unsafe { NonNull::new_unchecked(self.is_mut.get()).as_mut() } = false;
+            self.counter.store(0, Ordering::Release);
+        }
+        n
+    }
+
+    /// Tries to borrow the share.
+    ///
+    /// Fails is currently borrowed mutably.
+    pub fn try_borrow_ref(&self) -> Option<NonNull<Self>> {
+        // Create visitor
+        self.increment(futures::task::noop_waker);
+        if unsafe { self.check_mut_unchecked() } {
+            // Delete visitor if invalid
+            self.decrement();
+            None
         } else {
-            std::task::Poll::Pending
+            // Return borrow
+            Some(unsafe { NonNull::new_unchecked((self as *const Self) as *mut Self) })
         }
+    }
+
+    /// Try borrow the share mutably.
+    ///
+    /// Only works when count is 0.
+    pub fn try_borrow_mut(&self) -> Option<NonNull<Self>> {
+        if let Err(_) = self
+            .counter
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        {
+            return None;
+        }
+        *unsafe { NonNull::new_unchecked(self.is_mut.get()).as_mut() } = true;
+        self.counter.store(2, Ordering::Release);
+        Some(unsafe { NonNull::new_unchecked((self as *const Self) as *mut Self) })
     }
 }
 
-#[pinned_drop]
-impl<'env, S: Spawner> PinnedDrop for Anchor<'env, S> {
-    fn drop(self: Pin<&mut Self>) {
-        let projected = self.project();
-        // Will **always** be `Some` outside of `drop`.
-        let mut tasks = unsafe { projected.tasks.take().unwrap_unchecked() };
-        if tasks.is_empty() {
-            return;
-        }
-        // -----------------
-        // DON'T END UP HERE
-        // -----------------
-        projected
-            .spawner
-            .block_on(async move { while let Some(_) = tasks.next().await {} })
+/// Spawning handle for an Anchor.
+///
+/// *can be safely broadened as it can only spawn tasks.*
+#[derive(Debug, Clone)]
+pub struct Spawner</* In */ 'env, /* In */ T>(
+    futures::channel::mpsc::UnboundedSender</* In */ Pin<Box<dyn Future<Output = T> + 'env>>>,
+);
+
+impl<'env, T> Spawner<'env, T> {
+    pub fn spawn(
+        &mut self,
+        future: impl Future<Output = T> + 'env,
+    ) -> Result<(), futures::channel::mpsc::SendError> {
+        self.0.start_send(Box::pin(future))
     }
 }
 
-impl<'env, S: Spawner> Anchor<'env, S> {
-    pub fn new(spawner: S) -> Self {
+/// An anchor to handle safe scoped task "spawning".
+#[derive(Debug)]
+pub struct Anchor</* Mix */ 'env, /* Mix */ T> {
+    receiver: futures::channel::mpsc::UnboundedReceiver<
+        /* Out */ Pin<Box<dyn Future<Output = T> + 'env>>,
+    >,
+    pub spawner: Spawner</* In */ 'env, /* In */ T>,
+}
+
+impl<'env, T> Anchor<'env, T> {
+    pub fn new() -> Self {
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
         Anchor {
-            spawner,
-            tasks: Some(futures::stream::FuturesUnordered::new()),
-            _env: PhantomData::<fn(Pin<&'env ()>)>,
+            receiver,
+            spawner: Spawner(sender),
         }
     }
 
-    /// Spawns a new task.
-    ///
-    /// **supports growing of the `'env` lifetime as this can only limit what is spawned.**
-    pub fn spawn(self: Pin<&mut Self>, f: impl Future<Output = ()> + Send + 'env) {
-        let projected = self.project();
-        // Will **always** be `Some` outside of `drop`.
-        let tasks = unsafe { projected.tasks.as_ref().unwrap_unchecked() };
-        type TransSrc<'env> = Pin<Box<dyn Future<Output = ()> + Send + 'env>>;
-        type TransDst = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-        let join_handle = projected.spawner.spawn_unscoped(unsafe {
-            std::mem::transmute::<TransSrc<'env>, TransDst>(Box::pin(f))
-        });
-        tasks.push(<S as Spawner>::localise_handle(join_handle));
-    }
-
-    /// Spawns a new task on the same thread, circumventing the requirement for the future to be `Send`.
-    ///
-    /// **supports growing of the `'env` lifetime as this can only limit what is spawned.**
-    pub fn spawn_local(self: Pin<&mut Self>, f: impl Future<Output = ()> + 'env) {
-        let projected = self.project();
-        // Will **always** be `Some` outside of `drop`.
-        let tasks = unsafe { projected.tasks.as_ref().unwrap_unchecked() };
-        type TransSrc<'env> = Pin<Box<dyn Future<Output = ()> + 'env>>;
-        type TransDst = Pin<Box<dyn Future<Output = ()> + 'static>>;
-        let join_handle = projected.spawner.spawn_local_unscoped(unsafe {
-            std::mem::transmute::<TransSrc<'env>, TransDst>(Box::pin(f))
-        });
-        tasks.push(join_handle);
-    }
-
-    /// Leases immutable access to the memory referenced by `ptr` to arbitrary async tasks using reference counting.
-    ///
-    /// **`'a: 'env` communicates to the type system that `ptr` may be borrowed by `self` or the returned `BorrowHandle`,
-    /// requiring both to be dropped for the borrow to end.**
-    pub fn lease<'a: 'env, T>(
-        self: Pin<&mut Self>,
-        ptr: &'a T,
-    ) -> (BorrowHandle<'a, T>, Borrow<T>) {
-        let ptr = NonNull::from(ptr);
-        let (lessor, lessee) = create_contract(ptr);
-        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
-        let borrow = Borrow(lessee);
-        let handle = BorrowHandle {
-            original: ptr,
-            signal: receiver,
-            _borrow: PhantomData::<&'a T>,
-        };
-        self.spawn(async {
-            lessor.await;
-            sender.send(()).unwrap_or(());
-        });
-        (handle, borrow)
-    }
-
-    /// Leases mutable access to the memory referenced by `ptr` to arbitrary async tasks using reference counting.
-    ///
-    /// **`'a: 'env` communicates to the type system that `ptr` may be borrowed by `self` or the returned `BorrowHandle`,
-    /// requiring both to be dropped for the borrow to end.**
-    pub fn lease_mut<'a: 'env, T>(
-        self: Pin<&mut Self>,
-        ptr: &'a mut T,
-    ) -> (BorrowMutHandle<'a, T>, BorrowMut<T>) {
-        let ptr = NonNull::from(ptr);
-        let (lessor, lessee) = create_contract(ptr);
-        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
-        let borrow = BorrowMut(lessee);
-        let handle = BorrowMutHandle {
-            original: ptr,
-            signal: receiver,
-            _borrow: PhantomData::<&'a mut T>,
-        };
-        self.spawn(async {
-            lessor.await;
-            sender.send(()).unwrap_or(());
-        });
-        (handle, borrow)
-    }
-
-    /// Leases pinned immutable access to the memory referenced by `ptr` to arbitrary async tasks using reference counting.
-    ///
-    /// **`'a: 'env` communicates to the type system that `ptr` may be borrowed by `self` or the returned `BorrowHandle`,
-    /// requiring both to be dropped for the borrow to end.**
-    pub fn lease_pinned<'a: 'env, T>(
-        self: Pin<&mut Self>,
-        ptr: Pin<&'a T>,
-    ) -> (PinningBorrowHandle<'a, T>, Pin<Borrow<T>>) {
-        let ptr = NonNull::from(unsafe { Pin::into_inner_unchecked(ptr) });
-        let (lessor, lessee) = create_contract(ptr);
-        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
-        let borrow = unsafe { Pin::new_unchecked(Borrow(lessee)) };
-        let handle = PinningBorrowHandle {
-            original: ptr,
-            signal: receiver,
-            _borrow: PhantomData::<Pin<&'a T>>,
-        };
-        self.spawn(async {
-            lessor.await;
-            sender.send(()).unwrap_or(());
-        });
-        (handle, borrow)
-    }
-
-    /// Leases pinned mutable access to the memory referenced by `ptr` to arbitrary async tasks using reference counting.
-    ///
-    /// **`'a: 'env` communicates to the type system that `ptr` may be borrowed by `self` or the returned `BorrowHandle`,
-    /// requiring both to be dropped for the borrow to end.**
-    pub fn lease_pinned_mut<'a: 'env, T>(
-        self: Pin<&mut Self>,
-        ptr: Pin<&'a mut T>,
-    ) -> (PinningBorrowMutHandle<'a, T>, Pin<BorrowMut<T>>) {
-        let ptr = NonNull::from(unsafe { Pin::into_inner_unchecked(ptr) });
-        let (lessor, lessee) = create_contract(ptr);
-        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
-        let borrow = unsafe { Pin::new_unchecked(BorrowMut(lessee)) };
-        let handle = PinningBorrowMutHandle {
-            original: ptr,
-            signal: receiver,
-            _borrow: PhantomData::<Pin<&'a mut T>>,
-        };
-        self.spawn(async {
-            lessor.await;
-            sender.send(()).unwrap_or(());
-        });
-        (handle, borrow)
+    pub fn stream(self) -> Pool<'env, T> {
+        Pool {
+            receiver: self.receiver,
+            tasks: futures::stream::FuturesUnordered::new(),
+        }
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use crate::ScopeExt;
+impl<'env, T> Deref for Anchor<'env, T> {
+    type Target = Spawner<'env, T>;
 
-//     #[tokio::test]
-//     async fn vibe_check() {
-//         let mut x: u32 = 0;
-//         unsafe {
-//             async_scoped::TokioScope::<()>::scope(|scope| {
-//                 // borrow
-//                 let (handle, mut borrow) = scope.lease_mut(&mut x);
-//                 // spawn global
-//                 tokio::task::spawn(async move {
-//                     *borrow += 1;
-//                 });
-//                 scope.spawn_cancellable(
-//                     async move {
-//                         // await guard
-//                         let rx = handle.await;
-//                         *rx += 2;
-//                     },
-//                     Default::default,
-//                 );
-//             })
-//             .0
-//             .collect()
-//             .await
-//         };
-//     }
-// }
+    fn deref(&self) -> &Self::Target {
+        &self.spawner
+    }
+}
+
+impl<'env, T> DerefMut for Anchor<'env, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.spawner
+    }
+}
+
+/// A future for awaiting a collection of futures.
+///
+/// *can safely be narrowed as no more tasks can be spawned to it.*
+#[derive(Debug)]
+#[must_use = "streams do nothing unless polled"]
+pub struct Pool</* Out */ 'env, /* Out */ T> {
+    receiver: futures::channel::mpsc::UnboundedReceiver<
+        /* Out */ Pin<Box<dyn Future<Output = T> + 'env>>,
+    >,
+    tasks:
+        futures::stream::FuturesUnordered</* Out */ Pin<Box<dyn Future<Output = T> + 'env>>>,
+}
+
+impl<'env, T> Stream for Pool<'env, T> {
+    type Item = T;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        if self.receiver.is_terminated() {
+            // only the tasks now
+            return self.tasks.poll_next_unpin(cx);
+        }
+        loop {
+            match self.receiver.poll_next_unpin(cx) {
+                Poll::Ready(None) => {
+                    if self.tasks.is_terminated() {
+                        // end stream
+                        return Poll::Ready(None);
+                    } else {
+                        break;
+                    }
+                }
+                Poll::Ready(Some(task)) => {
+                    self.tasks.push(task);
+                    continue;
+                }
+                Poll::Pending => break,
+            }
+            #[allow(unreachable_code)]
+            {
+                unreachable!()
+            }
+        }
+        // we have awaited all we can from the receiver
+        if !self.tasks.is_terminated() {
+            // more tasks to run
+            match self.tasks.poll_next_unpin(cx) {
+                Poll::Ready(Some(val)) => return Poll::Ready(Some(val)),
+                Poll::Ready(None) => {
+                    if self.receiver.is_terminated() {
+                        // end stream
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Pending => (),
+            }
+        };
+        // we have awaited all we can for the tasks
+        Poll::Pending
+    }
+}
+
+impl<'env, T> FusedStream for Pool<'env, T> {
+    fn is_terminated(&self) -> bool {
+        self.tasks.is_terminated() && self.receiver.is_terminated()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+
+    use crate::Anchor;
+
+    #[tokio::test]
+    async fn vibe_check() {
+        let mut x: u32 = 0;
+        {
+            let mut anchor = Anchor::<&mut u32>::new();
+            let rx = &mut x;
+            anchor
+                .spawn(async move {
+                    *rx += 1;
+                    rx
+                })
+                .unwrap();
+            {
+                let stream = anchor.stream();
+                for ref_mut in stream.collect::<Vec<&mut u32>>().await {
+                    *ref_mut += 2;
+                }
+            }
+        }
+        assert_eq!(x, 3)
+    }
+}
