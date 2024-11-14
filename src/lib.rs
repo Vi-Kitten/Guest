@@ -304,9 +304,10 @@ impl<T> Contract<T> {
     }
 }
 
-
-pub struct Ref<T> {
+/// A lifetimeless reference to a value managed by an async cotract.
+pub struct Ref</* Out */ T> {
     visitor: VisitorView<T>,
+    _co_varience: PhantomData<*const /* Out */ T>,
 }
 
 unsafe impl<T: Sync> Sync for Ref<T> {}
@@ -318,53 +319,45 @@ impl<T> Deref for Ref<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self
+        self
             .visitor
-            .contract
             .as_ref()
-            .unwrap_unchecked()
-            .val
-            .get()
-            .as_ref()
-            .unwrap_unchecked()
-            .assume_init_ref()
-        }
     }
 }
 
 impl<T> Clone for Ref<T> {
     fn clone(&self) -> Self {
-        Ref { visitor: self.visitor.clone() }
+        Ref { visitor: self.visitor.clone(), _co_varience: PhantomData }
     }
 }
-pub struct UpgRef<T> {
+
+/// A lifetimeless upgradable reference to a value managed by an async cotract.
+/// 
+/// Requires `T: Send` to be able to be sent between threads to allow for constraint free upgrading.
+pub struct UpgRef</* Mix */ T> {
     visitor: VisitorView<T>,
+    _mixed_varience: PhantomData<*mut /* Mix */ T>,
 }
 
 unsafe impl<T: Sync> Sync for UpgRef<T> {}
 
-unsafe impl<T: Sync> Send for UpgRef<T> {}
+unsafe impl<T: Sync + Send> Send for UpgRef<T> {}
 
 impl<T> Deref for UpgRef<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self
+        self
             .visitor
-            .contract
             .as_ref()
-            .unwrap_unchecked()
-            .val
-            .get()
-            .as_ref()
-            .unwrap_unchecked()
-            .assume_init_ref()
-        }
     }
 }
 
 impl<T> UpgRef<T> {
-    pub fn upgrade(self) -> Result<RefMut<T>, Self> where T: Send {
+    /// Tries to upgrade to a mutable reference.
+    /// 
+    /// Fails if other references exist.
+    pub fn upgrade(self) -> Result<RefMut<T>, Self> {
         match unsafe { self
             .visitor
             .contract
@@ -373,24 +366,27 @@ impl<T> UpgRef<T> {
             .counter
             .compare_exchange(2, 2, Ordering::Acquire, Ordering::Relaxed)
         } {
-            Ok(_) => Ok(RefMut { visitor: self.visitor }),
+            Ok(_) => Ok(RefMut { visitor: self.visitor, _mixed_varience: PhantomData }),
             Err(_) => Err(self),
         }
     }
 
+    /// Trades upgradable access for easier sending.
     pub fn as_ref(self) -> Ref<T> {
-        Ref { visitor: self.visitor }
+        Ref { visitor: self.visitor, _co_varience: PhantomData }
     }
 }
 
-impl<T> Clone for RefMut<T> {
+impl<T> Clone for UpgRef<T> {
     fn clone(&self) -> Self {
-        RefMut { visitor: self.visitor.clone() }
+        UpgRef { visitor: self.visitor.clone(), _mixed_varience: PhantomData }
     }
 }
 
-pub struct RefMut<T> {
+/// A lifetimeless mutable reference to a value managed by an async cotract..
+pub struct RefMut</* Mix */ T> {
     visitor: VisitorView<T>,
+    _mixed_varience: PhantomData<*mut /* Mix */ T>,
 }
 
 unsafe impl<T: Sync> Sync for RefMut<T> {}
@@ -401,17 +397,9 @@ impl<T> Deref for RefMut<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self
+        self
             .visitor
-            .contract
             .as_ref()
-            .unwrap_unchecked()
-            .val
-            .get()
-            .as_ref()
-            .unwrap_unchecked()
-            .assume_init_ref()
-        }
     }
 }
 
@@ -419,25 +407,22 @@ impl<T> DerefMut for RefMut<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self
             .visitor
-            .contract
-            .as_ref()
-            .unwrap_unchecked()
-            .val
-            .get()
             .as_mut()
-            .unwrap_unchecked()
-            .assume_init_mut()
         }
     }
 }
 
 impl<T> RefMut<T> {
+    /// Downgrades the reference to an upgradable reference.
+    /// 
+    /// Most suitable for `Send` types.
     pub fn downgrade(self) -> UpgRef<T> {
-        UpgRef { visitor: self.visitor }
+        UpgRef { visitor: self.visitor, _mixed_varience: PhantomData }
     }
 
+    /// Trades mutable access for cloning.
     pub fn as_ref(self) -> Ref<T> {
-        Ref { visitor: self.visitor }
+        Ref { visitor: self.visitor, _co_varience: PhantomData }
     }
 }
 
@@ -453,21 +438,22 @@ impl<T> From<UpgRef<T>> for Ref<T> {
     }
 }
 
-pub struct Share<'owner, T> {
-    owner: OwnerView<'owner, T>
+pub struct Share</* Out */ 'owner, /* Mix */ T> {
+    owner: OwnerView<'owner, T>,
+    _mixed_varience: PhantomData<*mut /* Mix */ T>
 }
 
 impl<'owner, T> Share<'owner, T> {
     pub async fn aquire(self) -> Borrow<'owner, T> {
-        Borrow { unique: self.owner.aquire().await }
+        Borrow { unique: self.owner.aquire().await, _mixed_varience: PhantomData }
     }
 
     pub(crate) unsafe fn aquire_unchecked(self) -> Borrow<'owner, T> {
-        Borrow { unique: self.owner.aquire_unchecked() }
+        Borrow { unique: self.owner.aquire_unchecked(), _mixed_varience: PhantomData }
     }
 
     pub fn from_unique(unique: Borrow<'owner, T>) -> Self {
-        Self { owner: unique.unique.as_owner() }
+        Share { owner: unique.unique.as_owner(), _mixed_varience: PhantomData }
     }
 }
 
@@ -477,19 +463,20 @@ impl<'owner, T> From<Borrow<'owner, T>> for Share<'owner, T> {
     }
 }
 
-pub struct Borrow<'owner, T> {
-    unique: UniqueView<'owner, T>
+pub struct Borrow</* Out */ 'owner, /* Mix */ T> {
+    unique: UniqueView<'owner, T>,
+    _mixed_varience: PhantomData<*mut /* Mix */ T>
 }
 
 impl<'owner, T> Borrow<'owner, T> {
     pub fn borrow_ref(self) -> (Share<'owner, T>, Ref<T>) {
         let (owner, visitor) = self.unique.share();
-        (Share { owner }, Ref { visitor })
+        (Share { owner, _mixed_varience: PhantomData }, Ref { visitor, _co_varience: PhantomData })
     }
 
     pub fn borrow_mut(self) -> (Share<'owner, T>, RefMut<T>) {
         let (owner, visitor) = self.unique.share();
-        (Share { owner }, RefMut { visitor })
+        (Share { owner, _mixed_varience: PhantomData }, RefMut { visitor, _mixed_varience: PhantomData })
     }
 
     pub fn as_ref(self) -> Ref<T> {

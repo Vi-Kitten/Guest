@@ -12,7 +12,7 @@ pub struct ShareBox<T> {
 
 impl<T> ShareBox<T> {
     pub fn new(val: T) -> Self {
-        Self { contract: Box::into_raw(Box::new(val)) as *const _ }
+        Self { contract: Box::into_raw(Box::new(Contract::new(val))) as *const _ }
     }
 
     pub fn new_with<R>(val: T, f: impl for<'owner> FnOnce(Borrow<'owner, T>) -> R) -> (Self, R) {
@@ -35,7 +35,8 @@ impl<T> ShareBox<T> {
             panic!("cannot share null");
         }
         Share {
-            owner: unsafe { OwnerView::from_raw(self.contract) }
+            owner: unsafe { OwnerView::from_raw(self.contract) },
+            _mixed_varience: PhantomData,
         }
     }
 }
@@ -74,18 +75,21 @@ mod tests {
         {
             let this_reference = reference.clone();
             tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 this_reference.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             });
         }
         {
             let this_reference = reference.clone();
             tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 this_reference.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             });
         }
         {
             let this_reference = reference.clone();
             tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 this_reference.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             });
         }
